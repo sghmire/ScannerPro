@@ -1,4 +1,4 @@
-﻿using NTwain;
+using NTwain;
 using NTwain.Data;
 using System.Drawing;
 using System.Reflection;
@@ -78,6 +78,7 @@ namespace ScannerPro
         private readonly TwainSession _twainSession;
         private WindowsFormsMessageLoopHook? _messageLoopHook;
         private IntPtr _windowHandle;
+        private ScanSettings? _activeSettings;
 
         public TwainSession Session => _twainSession;
         public bool IsTwainOpen => _twainSession.State >= 3;
@@ -168,6 +169,8 @@ namespace ScannerPro
 
         private void Acquire(ScannerDevice device, ScanMode mode, ScanSettings settings)
         {
+            _activeSettings = settings;
+
             if (device.Backend == ScannerBackend.Wia)
             {
                 CloseSession();
@@ -214,7 +217,8 @@ namespace ScannerPro
 
                 using var stream = new MemoryStream(imageBytes);
                 using var image = Image.FromStream(stream);
-                ImageScanned?.Invoke((Image)image.Clone());
+                using var processed = PostProcessImage(image, settings);
+                ImageScanned?.Invoke((Image)processed.Clone());
             }
             catch (COMException ex) when (IsWiaBusy(ex))
             {
@@ -242,25 +246,71 @@ namespace ScannerPro
                 _ => (WiaIntentColor, WiaDataColor)
             };
 
-            TrySetWiaProperty(GetComProperty(scannerItem, "Properties"), WiaIpsCurIntent, intent);
-            TrySetWiaProperty(GetComProperty(scannerItem, "Properties"), WiaIpaDataType, dataType);
-            TrySetWiaProperty(GetComProperty(scannerItem, "Properties"), WiaIpaDepth, settings.BitDepth);
-            TrySetWiaProperty(GetComProperty(scannerItem, "Properties"), WiaIpsXRes, dpi);
-            TrySetWiaProperty(GetComProperty(scannerItem, "Properties"), WiaIpsYRes, dpi);
+            // If manual brightness or contrast is requested, we must clear the intent
+            // (set to WIA_INTENT_NONE/0), otherwise many drivers will auto-enhance
+            // the image and lock the Brightness/Contrast properties to read-only.
+            if (settings.Brightness != 0 || settings.Contrast != 0)
+            {
+                intent = 0;
+            }
+
+            var properties = GetComProperty(scannerItem, "Properties");
+
+            TrySetWiaProperty(properties, WiaIpsCurIntent, intent);
+            TrySetWiaProperty(properties, WiaIpaDataType, dataType);
+            TrySetWiaProperty(properties, WiaIpaDepth, settings.BitDepth);
+            TrySetWiaProperty(properties, WiaIpsXRes, dpi);
+            TrySetWiaProperty(properties, WiaIpsYRes, dpi);
 
             ApplyWiaRegion(scannerItem, settings, dpi);
 
-            // The UI exposes -100..100; WIA drivers typically use -1000..1000.
-            // Leave the scanner default untouched when the user hasn't adjusted it.
-            if (settings.Brightness != 0)
-            {
-                TrySetWiaProperty(GetComProperty(scannerItem, "Properties"), WiaIpsBrightness, settings.Brightness * 10);
-            }
-            if (settings.Contrast != 0)
-            {
-                TrySetWiaProperty(GetComProperty(scannerItem, "Properties"), WiaIpsContrast, settings.Contrast * 10);
-            }
+            ReleaseComObject(properties);
         }
+
+        private Image PostProcessImage(Image original, ScanSettings settings)
+        {
+            if (settings.Brightness == 0 && settings.Contrast == 0)
+            {
+                return original;
+            }
+
+            // Brightness: -100..100 maps to -1.0..1.0
+            float b = settings.Brightness / 100f;
+
+            // Contrast: -100..100 -> scaling factor.
+            // Formula: factor = (259 * (C + 255)) / (255 * (259 - C))
+            // Where C is -255 to 255. Our contrast is -100 to 100, so C = settings.Contrast * 2.55f.
+            float c = settings.Contrast * 2.55f;
+            float factor = (259f * (c + 255f)) / (255f * (259f - c));
+
+            // To apply contrast in ColorMatrix, we scale RGB by factor, and shift by translation.
+            float t = 0.5f * (1.0f - factor) + b;
+
+            var cm = new System.Drawing.Imaging.ColorMatrix(new float[][]
+            {
+                new float[] { factor, 0, 0, 0, 0 },
+                new float[] { 0, factor, 0, 0, 0 },
+                new float[] { 0, 0, factor, 0, 0 },
+                new float[] { 0, 0, 0, 1, 0 },
+                new float[] { t, t, t, 0, 1 }
+            });
+
+            var ia = new System.Drawing.Imaging.ImageAttributes();
+            ia.SetColorMatrix(cm);
+
+            var adjusted = new Bitmap(original.Width, original.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            adjusted.SetResolution(original.HorizontalResolution, original.VerticalResolution);
+            
+            using (var g = Graphics.FromImage(adjusted))
+            {
+                g.DrawImage(original, new Rectangle(0, 0, original.Width, original.Height),
+                    0, 0, original.Width, original.Height, GraphicsUnit.Pixel, ia);
+            }
+
+            return adjusted;
+        }
+
+
 
         private void ApplyWiaRegion(object scannerItem, ScanSettings settings, int dpi)
         {
@@ -269,14 +319,63 @@ namespace ScannerPro
                 return;
             }
 
-            // WIA region properties are in pixels at the current resolution.
+            var properties = GetComProperty(scannerItem, "Properties");
+
+            // WIA 1.0 drivers use thousandths of an inch for extents, while WIA 2.0 drivers use pixels.
+            // We can detect which unit the driver expects by examining the max value of XExtent.
+            bool useThousandths = false;
+            try
+            {
+                var pXExtent = GetIndexedComProperty(properties, WiaIpsXExtent);
+                int xExtentMax = Convert.ToInt32(GetComProperty(pXExtent, "SubTypeMax"));
+                ReleaseComObject(pXExtent);
+
+                try
+                {
+                    // WIA_IPS_MAX_HORIZONTAL_SIZE (6153) is always in thousandths of an inch.
+                    var pMaxHorz = GetIndexedComProperty(properties, 6153);
+                    int maxHorz = Convert.ToInt32(GetComProperty(pMaxHorz, "Value"));
+                    ReleaseComObject(pMaxHorz);
+
+                    if (xExtentMax == maxHorz)
+                    {
+                        useThousandths = true;
+                    }
+                }
+                catch
+                {
+                    // Fallback if 6153 is missing: deduce unit from reasonable bed sizes (4" to 17").
+                    double inchesAsThousandths = xExtentMax / 1000.0;
+                    double inchesAsPixels = (double)xExtentMax / dpi;
+
+                    if (inchesAsThousandths >= 4.0 && inchesAsThousandths <= 17.0 && inchesAsPixels > 17.0)
+                    {
+                        useThousandths = true;
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore errors and default to pixels.
+            }
+
             // Set origin before extent; several drivers validate extent against
             // the current origin and reject/off-by-shift windows if this is reversed.
-            var xExtent = Math.Max(1, (int)Math.Round(region.Width * dpi));
-            var yExtent = Math.Max(1, (int)Math.Round(region.Height * dpi));
-            var xPos = Math.Max(0, (int)Math.Round(region.X * dpi));
-            var yPos = Math.Max(0, (int)Math.Round(region.Y * dpi));
-            var properties = GetComProperty(scannerItem, "Properties");
+            int xExtent, yExtent, xPos, yPos;
+            if (useThousandths)
+            {
+                xExtent = Math.Max(1, (int)Math.Round(region.Width * 1000));
+                yExtent = Math.Max(1, (int)Math.Round(region.Height * 1000));
+                xPos = Math.Max(0, (int)Math.Round(region.X * 1000));
+                yPos = Math.Max(0, (int)Math.Round(region.Y * 1000));
+            }
+            else
+            {
+                xExtent = Math.Max(1, (int)Math.Round(region.Width * dpi));
+                yExtent = Math.Max(1, (int)Math.Round(region.Height * dpi));
+                xPos = Math.Max(0, (int)Math.Round(region.X * dpi));
+                yPos = Math.Max(0, (int)Math.Round(region.Y * dpi));
+            }
 
             TrySetWiaProperty(properties, WiaIpsXPos, xPos);
             TrySetWiaProperty(properties, WiaIpsYPos, yPos);
@@ -738,7 +837,15 @@ namespace ScannerPro
                     if (stream != null)
                     {
                         using var bitmap = Image.FromStream(stream);
-                        ImageScanned?.Invoke((Image)bitmap.Clone());
+                        if (_activeSettings != null)
+                        {
+                            using var processed = PostProcessImage(bitmap, _activeSettings);
+                            ImageScanned?.Invoke((Image)processed.Clone());
+                        }
+                        else
+                        {
+                            ImageScanned?.Invoke((Image)bitmap.Clone());
+                        }
                     }
                 }
             }

@@ -963,22 +963,33 @@ namespace ScannerPro
                 return img;
             }
 
-            // Previews run at PreviewDpi, full scans at the chosen resolution.
-            float dpi = _lastWasPreview ? ScanSettings.PreviewDpi : (settings.Dpi <= 0 ? 1 : settings.Dpi);
-            float expectedRoiWidth = Math.Max(1, region.Width * dpi);
-            float expectedRoiHeight = Math.Max(1, region.Height * dpi);
+            // Work from the image's OWN resolution, not the DPI we requested:
+            // scanners often honor the region but return it at a different DPI
+            // (e.g. clamping a low-DPI preview up to their minimum). Assuming the
+            // requested DPI here is what made the crop grab only a tiny corner.
+            float fallbackDpi = _lastWasPreview ? ScanSettings.PreviewDpi : (settings.Dpi <= 0 ? 1 : settings.Dpi);
+            float dpiX = ResolveImageDpi(img.HorizontalResolution, fallbackDpi);
+            float dpiY = ResolveImageDpi(img.VerticalResolution, dpiX);
 
-            // If the scanner honored the hardware region, the image is already the
-            // requested region - leave it alone. Otherwise it returned the full bed.
-            if (IsCloseToExpectedRoiSize(img, expectedRoiWidth, expectedRoiHeight))
+            float physicalWidth = img.Width / dpiX;
+            float physicalHeight = img.Height / dpiY;
+            var bed = ScanTargetSize.BedRectInches;
+
+            // Decide whether the scanner already returned just the region, or the
+            // full bed, by whichever the measured physical size is closest to.
+            // Nearest-match tolerates DPI reporting that is off but proportional,
+            // and it distinguishes sizes that share the bed's aspect ratio (A4).
+            float distanceToRegion = Math.Abs(physicalWidth - region.Width) + Math.Abs(physicalHeight - region.Height);
+            float distanceToBed = Math.Abs(physicalWidth - bed.Width) + Math.Abs(physicalHeight - bed.Height);
+            if (distanceToRegion <= distanceToBed)
             {
-                return img;
+                return img; // already the requested region
             }
 
-            var cropped = CropRegionPixels(img, region, dpi);
+            var cropped = CropRegionPixels(img, region, dpiX, dpiY);
             if (cropped is Bitmap croppedBitmap)
             {
-                croppedBitmap.SetResolution(dpi, dpi);
+                croppedBitmap.SetResolution(dpiX, dpiY);
             }
             if (!ReferenceEquals(cropped, img))
             {
@@ -987,23 +998,16 @@ namespace ScannerPro
             return cropped;
         }
 
-        private static bool IsCloseToExpectedRoiSize(Image img, float expectedWidth, float expectedHeight)
-        {
-            var widthTolerance = Math.Max(8f, expectedWidth * 0.08f);
-            var heightTolerance = Math.Max(8f, expectedHeight * 0.08f);
-            return Math.Abs(img.Width - expectedWidth) <= widthTolerance
-                && Math.Abs(img.Height - expectedHeight) <= heightTolerance;
-        }
         /// <summary>
         /// Crops a full-bed image to a region expressed in inches from the bed
-        /// origin, converting to pixels via the image's effective resolution.
+        /// origin, converting to pixels via the image's actual resolution.
         /// </summary>
-        private static Image CropRegionPixels(Image img, RectangleF regionInches, float dpi)
+        private static Image CropRegionPixels(Image img, RectangleF regionInches, float dpiX, float dpiY)
         {
-            var x = (int)Math.Round(regionInches.X * dpi);
-            var y = (int)Math.Round(regionInches.Y * dpi);
-            var w = (int)Math.Round(regionInches.Width * dpi);
-            var h = (int)Math.Round(regionInches.Height * dpi);
+            var x = (int)Math.Round(regionInches.X * dpiX);
+            var y = (int)Math.Round(regionInches.Y * dpiY);
+            var w = (int)Math.Round(regionInches.Width * dpiX);
+            var h = (int)Math.Round(regionInches.Height * dpiY);
 
             x = Math.Max(0, Math.Min(x, img.Width - 1));
             y = Math.Max(0, Math.Min(y, img.Height - 1));
@@ -1268,6 +1272,9 @@ namespace ScannerPro
 
             public static readonly ScanTargetSize FullBed = new("Full bed - 12.2 x 17.2 in", null);
             public static readonly ScanTargetSize ManualRoi = new("ROI / manual selection", null, isManualRoi: true);
+
+            /// <summary>The scanner's full scan-bed area, in inches from the origin.</summary>
+            public static RectangleF BedRectInches => new(0, 0, BedWidthInches, BedHeightInches);
 
             private ScanTargetSize(string text, RectangleF? regionInches, bool isManualRoi = false)
             {

@@ -65,6 +65,7 @@ namespace ScannerPro
         private void InitializeUI()
         {
             Text = "ScannerPro";
+            try { this.Icon = new Icon("Icon.ico"); } catch { }
             Size = new Size(1000, 850);
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(780, 480);

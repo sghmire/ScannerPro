@@ -1,0 +1,57 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+build/
+bld/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.rsuser
+
+# Rider / VS Code
+.idea/
+.vscode/
+*.DotSettings.user
+
+# NuGet
+*.nupkg
+*.snupkg
+project.lock.json
+project.fragment.lock.json
+*.nuget.props
+*.nuget.targets
+
+# Test / publish artifacts
+artifacts/
+[Tt]est[Rr]esult*/
+publish/
+*.publishsettings
+PublishScripts/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# App-specific: scanned output should not be committed
+Scan*.jpg
+Scan*.png
+Scan*.tif
+Scan*.pdf
+Document*.pdf
